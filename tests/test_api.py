@@ -212,3 +212,217 @@ def test_probe_bad_method_422(client):
 def test_openapi_docs_available(client):
     assert client.get("/openapi.json").status_code == 200
     assert client.get("/docs").status_code == 200
+
+
+# ------------------------------------------------------------- 白名单规划 API
+PLAN_URL = "/api/v1/whitelist/plans"
+
+
+def test_plan_uses_configured_whitelist_by_default(client):
+    r = client.post(
+        PLAN_URL,
+        json={
+            "max_cidrs": 3,
+            "domains": [
+                {"domain": "hooks.a.test", "addresses": ["127.0.0.1"]},
+                {"domain": "hooks.b.test", "addresses": ["203.0.113.9"]},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["current_cidrs_source"] == "configured"
+    assert body["current_configured_cidrs"] == ["127.0.0.1/32"]
+    assert body["selected_domains"] == ["hooks.a.test", "hooks.b.test"]
+    assert body["cidrs"] == ["127.0.0.1/32", "203.0.113.9/32"]
+    assert body["rule_count"] == 2
+    assert body["feasible"] is True
+    assert body["migration_possible"] is True
+    assert body["read_only"] is True
+    assert body["coverage"] == {
+        "exact": True,
+        "covers_current_whitelist": True,
+        "selected_domains_fully_covered": True,
+        "listed_address_count": 2,
+        "expected_union_address_count": 2,
+    }
+    assert [c["selected"] for c in body["candidates"]] == [True, True]
+
+
+def test_plan_request_can_override_current_cidrs(client):
+    body = client.post(
+        PLAN_URL,
+        json={
+            "current_cidrs": ["172.31.10.0/24"],
+            "max_cidrs": 1,
+            "domains": [
+                {"domain": "inside.test", "addresses": ["172.31.10.99"]},
+            ],
+        },
+    ).json()
+    assert body["current_cidrs_source"] == "request"
+    assert body["current_configured_cidrs"] == ["172.31.10.0/24"]
+    assert body["selected_domains"] == ["inside.test"]
+    assert body["cidrs"] == ["172.31.10.0/24"]
+
+
+def test_plan_zero_migration_is_feasible(client):
+    body = client.post(
+        PLAN_URL,
+        json={
+            "current_cidrs": ["172.31.10.0/24"],
+            "max_cidrs": 1,
+            "domains": [{"domain": "outside.test", "addresses": ["203.0.113.5"]}],
+        },
+    ).json()
+    assert body["feasible"] is True
+    assert body["migration_possible"] is False
+    assert body["selected_domains"] == []
+    assert body["cidrs"] == ["172.31.10.0/24"]
+    assert "没有可迁移域名" in body["message"]
+
+
+def test_plan_no_solution_is_reported(client):
+    body = client.post(
+        PLAN_URL,
+        json={
+            "current_cidrs": ["10.0.0.0/24", "10.0.2.0/24"],
+            "max_cidrs": 1,
+            "domains": [{"domain": "a.test", "addresses": ["10.1.0.1"]}],
+        },
+    ).json()
+    assert body["feasible"] is False
+    assert body["migration_possible"] is False
+    assert body["cidrs"] == []
+    assert body["rule_count"] is None
+    assert body["coverage"]["exact"] is False
+    assert "无可行方案" in body["message"]
+
+
+def test_plan_maximizes_domains_then_minimizes_rules(client):
+    body = client.post(
+        PLAN_URL,
+        json={
+            "current_cidrs": ["10.0.0.0/24"],
+            "max_cidrs": 3,
+            "domains": [
+                {"domain": "aaa", "addresses": ["10.5.0.1", "10.7.0.1"]},
+                {"domain": "x", "addresses": ["10.1.0.1"]},
+                {"domain": "y", "addresses": ["10.2.0.1"]},
+            ],
+        },
+    ).json()
+    assert body["selected_domains"] == ["x", "y"]
+    assert body["rule_count"] == 3
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        (
+            {
+                "current_cidrs": ["10.0.0.0/24"],
+                "max_cidrs": 2,
+                "domains": [
+                    {"domain": "a.test", "addresses": ["10.1.0.1"]},
+                ] * 2,
+            },
+            "重复",
+        ),
+        (
+            {
+                "current_cidrs": ["10.0.0.0/24"],
+                "max_cidrs": 2,
+                "domains": [{"domain": "a.test", "addresses": ["2001:db8::1"]}],
+            },
+            "IPv6",
+        ),
+        (
+            {
+                "current_cidrs": ["2001:db8::/32"],
+                "max_cidrs": 2,
+                "domains": [{"domain": "a.test", "addresses": ["10.1.0.1"]}],
+            },
+            "IPv6",
+        ),
+    ],
+)
+def test_plan_invalid_payload_422(client, payload, detail):
+    r = client.post(PLAN_URL, json=payload)
+    assert r.status_code == 422
+    assert detail in str(r.json())
+
+
+def test_plan_rejects_more_than_12_domains(client):
+    payload = {
+        "current_cidrs": ["10.0.0.0/24"],
+        "max_cidrs": 20,
+        "domains": [
+            {"domain": f"d{i}.test", "addresses": ["10.1.0.1"]} for i in range(13)
+        ],
+    }
+    r = client.post(PLAN_URL, json=payload)
+    assert r.status_code == 422
+
+
+def test_plan_rejects_unknown_fields(client):
+    r = client.post(
+        PLAN_URL,
+        json={
+            "current_cidrs": ["10.0.0.0/24"],
+            "max_cidrs": 2,
+            "domains": [{"domain": "a.test", "addresses": ["10.1.0.1"], "x": 1}],
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_plan_rejects_empty_address_group(client):
+    r = client.post(
+        PLAN_URL,
+        json={
+            "max_cidrs": 2,
+            "domains": [{"domain": "a.test", "addresses": []}],
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_plan_without_candidates_keeps_whitelist(client):
+    body = client.post(
+        PLAN_URL,
+        json={"current_cidrs": ["10.0.0.0/24"], "max_cidrs": 1, "domains": []},
+    ).json()
+    assert body["feasible"] is True
+    assert body["selected_domains"] == []
+    assert body["cidrs"] == ["10.0.0.0/24"]
+    assert body["coverage"]["exact"] is True
+
+
+def test_plan_is_read_only_and_sends_no_traffic(client):
+    before_dns = list(client._dns.queried_names) if hasattr(
+        client._dns, "queried_names"
+    ) else None
+    before_http = len(client._http.requests)
+    r = client.post(
+        PLAN_URL,
+        json={
+            "current_cidrs": ["10.0.0.0/24"],
+            "max_cidrs": 2,
+            "domains": [
+                {"domain": "api-good.test", "addresses": ["10.1.0.1"]}
+            ],
+        },
+    )
+    assert r.status_code == 200
+    assert len(client._http.requests) == before_http
+    if before_dns is not None:
+        assert client._dns.queried_names == before_dns
+    # 探测服务自身配置未改变
+    assert client.get("/api/v1/policy").json()["allowed_cidrs"] == ["127.0.0.1/32"]
+
+
+def test_plan_documented_in_openapi(client):
+    spec = client.get("/openapi.json").json()
+    assert PLAN_URL in spec["paths"]
+    assert "post" in spec["paths"][PLAN_URL]

@@ -114,6 +114,32 @@ services:
       target-allowed:
         condition: service_started
 
+  # 白名单迁移规划演示（一次性任务，按需运行，默认 up 不启动）：
+  #   docker compose --profile demo run --rm plan-demo
+  # 只读：仅调用 probe 的规划/探测接口与 DNS 控制面切换演示 profile。
+  plan-demo:
+    build: .
+    profiles: ["demo"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for i in $$(seq 1 30); do
+          curl -sf http://probe:8000/healthz >/dev/null && break
+          sleep 1
+        done
+        PROBE_BASE=http://probe:8000 DNS_CTRL=http://dns-service:8053 \
+          sh /app/scripts/plan-demo.sh
+    volumes:
+      - ./scripts:/app/scripts:ro
+    networks:
+      - net_dns
+    depends_on:
+      probe:
+        condition: service_started
+      dns-service:
+        condition: service_started
+
 volumes:
   certs:
   dns-state:

@@ -2,7 +2,8 @@
 
 * 全异步实现，慢探测不会阻塞事件循环与其他请求；
 * 并发量由信号量保护，超出立即返回 429，不排队堆积；
-* 单次探测有总超时，超时返回 408 并附带已完成的逐跳信息。
+* 单次探测有总超时，超时返回 408 并附带已完成的逐跳信息；
+* 另提供只读的白名单迁移规划接口（纯计算，不发起网络请求、不修改配置）。
 """
 
 from __future__ import annotations
@@ -12,12 +13,14 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import Body, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Settings, load_settings
 from .dns_client import DnsResolver
 from .http_probe import Prober
+from .planner import PlanError, build_plan
 from .policy import PolicyError
 
 
@@ -87,6 +90,114 @@ class PolicyResponse(BaseModel):
     timeouts: dict
 
 
+class PlanDomainInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    domain: str = Field(..., description="回调域名（去重后参与规划）")
+    addresses: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "探测报告里的完整 IPv4 地址组（必须全部列出，不能只给部分）；"
+            "至少 1 个地址，空组表示无法确认，将以 422 拒绝"
+        ),
+    )
+
+
+class PlanRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "max_cidrs": 2,
+                    "domains": [
+                        {
+                            "domain": "hooks.a.demo.test",
+                            "addresses": ["172.31.10.20"],
+                        },
+                        {
+                            "domain": "hooks.b.demo.test",
+                            "addresses": ["203.0.113.20", "203.0.113.21"],
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+
+    domains: list[PlanDomainInput] = Field(
+        ...,
+        max_length=12,
+        description="待迁移回调域名，最多 12 个；每个域名必须给出全部 IPv4 地址",
+    )
+    max_cidrs: int = Field(
+        ...,
+        ge=0,
+        description="设备能容纳的 CIDR 总条数（结果清单不得超过该值）",
+    )
+    current_cidrs: list[str] | None = Field(
+        None,
+        description=(
+            "当前设备上生效的 IPv4 白名单；省略时使用本服务配置的 ALLOWED_CIDRS。"
+            "仅在演练“若白名单是另一组值”时显式传入，规划始终精确保留其覆盖率"
+        ),
+    )
+
+
+class PlanCandidateModel(BaseModel):
+    domain: str
+    addresses: list[str]
+    selected: bool
+    reason: str
+
+
+class PlanCoverageModel(BaseModel):
+    exact: bool = Field(..., description="清单覆盖范围是否恰好等于所需并集")
+    covers_current_whitelist: bool
+    selected_domains_fully_covered: bool
+    listed_address_count: int
+    expected_union_address_count: int
+
+
+class PlanResponse(BaseModel):
+    feasible: bool = Field(
+        ..., description="是否存在满足上限、且精确保留当前放行范围的清单"
+    )
+    migration_possible: bool = Field(
+        ..., description="是否存在至少迁移一个域名的可行方案（即返回值是否非空）"
+    )
+    selected_domains: list[str] = Field(
+        ..., description="可迁移域名（每个域名的全部地址都被清单覆盖）"
+    )
+    cidrs: list[str] = Field(
+        ..., description="可替换当前白名单的 CIDR 清单（精确覆盖并集，条数不超过上限）"
+    )
+    rule_count: int | None = Field(
+        None, description="清单条数；无可行方案时为 null"
+    )
+    max_cidrs: int
+    current_configured_cidrs: list[str] = Field(
+        ..., description="提交时声明的当前白名单（原样）"
+    )
+    current_exact_cidrs: list[str] = Field(
+        ..., description="当前白名单的最小精确 CIDR 表示（结果清单的基础）"
+    )
+    current_rule_count: int = Field(..., description="当前白名单的最小精确 CIDR 条数")
+    candidates: list[PlanCandidateModel] = Field(
+        ..., description="每个候选域名的入选与否及原因"
+    )
+    coverage: PlanCoverageModel = Field(..., description="对清单覆盖范围的独立核对")
+    read_only: bool = Field(
+        True, description="本接口为只读规划：不发起网络请求、不修改任何配置"
+    )
+    current_cidrs_source: str = Field(
+        ...,
+        description="current_cidrs 的来源：request（请求体显式传入）或 configured（ALLOWED_CIDRS）",
+    )
+    message: str = Field(..., description="面向值班员的人类可读结论")
+
+
 settings: Settings = load_settings()
 resolver = DnsResolver(
     settings.dns_server,
@@ -145,6 +256,133 @@ async def get_policy() -> PolicyResponse:
             "read": settings.read_timeout,
             "overall": settings.overall_timeout,
         },
+    )
+
+
+@app.post(
+    "/api/v1/whitelist/plans",
+    response_model=PlanResponse,
+    tags=["plan"],
+    summary="只读规划：在 CIDR 上限内最大化可迁移域名数",
+)
+async def create_whitelist_plan(
+    req: PlanRequest = Body(
+        ...,
+        openapi_examples={
+            "demo_merged": {
+                "summary": "演示：域名地址落在现有白名单内，零新增规则",
+                "description": (
+                    "probe 容器配置的白名单是 172.31.10.0/24（省略 current_cidrs）。"
+                    "hooks.allowed.demo.test 解析到该网段内，直接被现有清单覆盖；"
+                    "hooks.external.demo.test 在 203.0.113.0/24，需要额外 1 条 /32。"
+                ),
+                "value": {
+                    "max_cidrs": 2,
+                    "domains": [
+                        {
+                            "domain": "hooks.allowed.demo.test",
+                            "addresses": ["172.31.10.10"],
+                        },
+                        {
+                            "domain": "hooks.external.demo.test",
+                            "addresses": ["203.0.113.20", "203.0.113.21"],
+                        },
+                    ],
+                },
+            },
+            "demo_no_solution": {
+                "summary": "无可行方案：当前白名单精确表示已超过上限",
+                "description": (
+                    "现有白名单 10.0.0.0/24 与 10.0.2.0/24 之间存在空洞，"
+                    "最小精确表示需要 2 条 CIDR，而设备只能放 1 条，"
+                    "因此 feasible=false、cidrs 为空。"
+                ),
+                "value": {
+                    "current_cidrs": ["10.0.0.0/24", "10.0.2.0/24"],
+                    "max_cidrs": 1,
+                    "domains": [
+                        {"domain": "hooks.example.test", "addresses": ["10.1.0.1"]}
+                    ],
+                },
+            },
+            "demo_tradeoff": {
+                "summary": "上限内域名数优先、其次规则更少",
+                "description": (
+                    "三个域名中，上限 3 条时最优先选 2 个域名（占满 3 条）；"
+                    "单个域名虽只需 2 条，但域名数更少，故不采用。"
+                ),
+                "value": {
+                    "current_cidrs": ["10.0.0.0/24"],
+                    "max_cidrs": 3,
+                    "domains": [
+                        {"domain": "two-rules.test", "addresses": ["10.5.0.1", "10.7.0.1"]},
+                        {"domain": "one-rule-a.test", "addresses": ["10.1.0.1"]},
+                        {"domain": "one-rule-b.test", "addresses": ["10.2.0.1"]},
+                    ],
+                },
+            },
+        },
+    ),
+) -> PlanResponse:
+    """只读规划：在保留现有放行范围的前提下，最大化可迁移域名数。
+
+    * 结果清单的覆盖范围恰好是“当前白名单 ∪ 入选域名全部地址”，不多不少；
+    * 域名只有在其全部地址都被覆盖时才可入选；
+    * 在 CIDR 上限内优先选域名最多，其次选规则更少；无可行方案时
+      ``feasible=false``、清单为空并在 ``message`` 中说明原因；
+    * 不发起任何 DNS/HTTP 请求，也不修改白名单配置。
+    """
+    current_cidrs = (
+        req.current_cidrs
+        if req.current_cidrs is not None
+        else settings.allowed_cidrs
+    )
+    try:
+        # 组合枚举是 CPU 密集的纯计算，放到线程池避免阻塞探测事件循环
+        plan = await run_in_threadpool(
+            build_plan,
+            current_cidrs=current_cidrs,
+            domains=[(d.domain, d.addresses) for d in req.domains],
+            max_cidrs=req.max_cidrs,
+        )
+    except PlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return PlanResponse(
+        feasible=plan.feasible,
+        migration_possible=plan.migration_possible,
+        selected_domains=list(plan.selected_domains),
+        cidrs=[str(net) for net in plan.cidrs],
+        rule_count=plan.rule_count,
+        max_cidrs=plan.max_cidrs,
+        current_configured_cidrs=[str(net) for net in plan.current_configured_cidrs],
+        current_exact_cidrs=[str(net) for net in plan.current_exact_cidrs],
+        current_rule_count=plan.current_rule_count,
+        candidates=[
+            PlanCandidateModel(
+                domain=c.domain,
+                addresses=list(c.addresses),
+                selected=c.selected,
+                reason=c.reason,
+            )
+            for c in plan.candidates
+        ],
+        coverage=PlanCoverageModel(
+            exact=plan.coverage.exact,
+            covers_current_whitelist=plan.coverage.covers_current_whitelist,
+            selected_domains_fully_covered=(
+                plan.coverage.selected_domains_fully_covered
+            ),
+            listed_address_count=plan.coverage.listed_address_count,
+            expected_union_address_count=(
+                plan.coverage.expected_union_address_count
+            ),
+        ),
+        read_only=True,
+        current_cidrs_source=(
+            "request" if req.current_cidrs is not None else "configured"
+        ),
+        message=plan.message,
     )
 
 

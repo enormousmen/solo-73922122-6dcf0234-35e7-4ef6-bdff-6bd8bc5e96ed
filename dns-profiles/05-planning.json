@@ -1,0 +1,26 @@
+{
+  "profile": "planning",
+  "description": "白名单迁移规划场景：候选回调域名分布在允许网段内外，用于演示只读规划 API",
+  "zones": {
+    "allowed.demo.test":          ["172.31.10.10"],
+    "www.allowed.demo.test":      ["172.31.10.10"],
+    "https.allowed.demo.test":    ["172.31.10.10"],
+    "multi-a.demo.test":          ["172.31.10.10", "172.31.10.11"],
+    "redirect-ok.demo.test":      ["172.31.10.10"],
+    "redirect-final.demo.test":   ["172.31.10.10"],
+    "loop1.demo.test":            ["172.31.10.10"],
+    "loop2.demo.test":            ["172.31.10.10"],
+    "loop3.demo.test":            ["172.31.10.10"],
+    "loop4.demo.test":            ["172.31.10.10"],
+    "forbidden.demo.test":        ["172.31.20.10"],
+    "swapped.demo.test":          ["172.31.10.10"],
+
+    "hooks.inside.demo.test":     ["172.31.10.50"],
+    "hooks.inside2.demo.test":    ["172.31.10.51"],
+    "hooks.webhook.demo.test":    ["172.31.10.60", "172.31.10.61"],
+    "hooks.external.demo.test":   ["203.0.113.20"],
+    "hooks.external2.demo.test":  ["203.0.113.21"],
+    "hooks.multi-a.demo.test":    ["172.31.10.70", "203.0.113.30"],
+    "hooks.denied.demo.test":     ["172.31.20.10"]
+  }
+}

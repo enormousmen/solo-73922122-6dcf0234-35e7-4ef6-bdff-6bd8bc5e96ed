@@ -40,6 +40,7 @@ URL 静态校验（不产生流量）
 app/
   probe/            探测服务
     policy.py       IPv4 CIDR 白名单与 URL 静态校验（所有连接决策的唯一入口）
+    planner.py      白名单迁移规划（纯计算：精确最小 CIDR、组合最优选择）
     dns_wire.py     自研 DNS 线协议（RFC1035 子集，查询/应答/压缩指针防护）
     dns_client.py   异步 DNS 客户端（仅向配置的解析器发 A 查询）
     connection.py   固定到已批准 IP 的 TCP 连接 + 强制校验的 TLS
@@ -49,10 +50,11 @@ app/
   dns_service/      本地可切换解析的 DNS（UDP/53 + HTTP 控制面 profile 热切换）
   targets/          演示目标（HTTP/8080、HTTPS/8443，含各类跳转与访问记录）
   certinit/         生成演示 CA、服务器证书、合并 CA bundle
-dns-profiles/       DNS 场景：allowed / swapped / mixed / loop
+dns-profiles/       DNS 场景：allowed / swapped / mixed / loop / planning
 compose.yaml        一键启动的完整演示环境
-tests/              57 个测试（策略、DNS 协议、TLS、跳转、并发、API 全链路）
-scripts/demo.sh     演示脚本
+tests/              127 个测试（策略、DNS 协议、TLS、跳转、并发、规划、API 全链路）
+scripts/demo.sh     探测演示脚本
+scripts/plan-demo.sh 白名单迁移规划演示脚本（只读）
 ```
 
 ## 快速开始
@@ -131,6 +133,77 @@ open http://127.0.0.1:8000/docs
 
 辅助接口：`GET /api/v1/policy`（当前白名单与超时配置）、`GET /healthz`。
 
+### `POST /api/v1/whitelist/plans`（只读规划）
+
+出口设备的 CIDR 条数有限，值班员希望**保留现有放行范围**的同时尽量多迁移
+回调域名。本接口提交候选域名及其在探测报告中的**完整 IPv4 地址组**与设备
+CIDR 上限，返回可直接替换当前白名单的 CIDR 清单和可迁移域名。
+
+请求体：
+
+```json
+{
+  "max_cidrs": 2,
+  "domains": [
+    { "domain": "hooks.allowed.demo.test", "addresses": ["172.31.10.10"] },
+    { "domain": "hooks.external.demo.test",
+      "addresses": ["203.0.113.20", "203.0.113.21"] }
+  ],
+  "current_cidrs": ["172.31.10.0/24"]
+}
+```
+
+- `domains`：1..12 个，每个域名必须给出**全部** IPv4 地址（至少 1 个，空组 422）；
+- `max_cidrs`：设备可容纳的 CIDR 总条数，`>= 0`；
+- `current_cidrs`：可选；省略时使用本服务配置的 `ALLOWED_CIDRS`（响应中
+  `current_cidrs_source` 标明来源）。
+
+响应（关键字段）：
+
+```json
+{
+  "feasible": true,
+  "migration_possible": true,
+  "selected_domains": ["hooks.allowed.demo.test", "hooks.external.demo.test"],
+  "cidrs": ["172.31.10.0/24", "203.0.113.20/31"],
+  "rule_count": 2,
+  "max_cidrs": 2,
+  "current_exact_cidrs": ["172.31.10.0/24"],
+  "current_rule_count": 1,
+  "coverage": {
+    "exact": true,
+    "covers_current_whitelist": true,
+    "selected_domains_fully_covered": true,
+    "listed_address_count": 258,
+    "expected_union_address_count": 258
+  },
+  "read_only": true,
+  "message": "已生成规划：迁移 2 个域名，共需 2 条 CIDR（上限 2）；..."
+}
+```
+
+语义保证：
+
+| 要求 | 实现方式 |
+| --- | --- |
+| 精确保留现有放行范围 | 以**当前白名单的最小精确 CIDR 表示**为基础，结果只做并入 |
+| 清单覆盖范围恰好是并集 | 只合并重叠/首尾相邻区间，再用对齐分解；不跨越空洞聚合 |
+| 每个地址都放行才可入选 | 入选当且仅当其全部地址包含在清单地址集合中 |
+| 上限内域名最多 | 枚举全部子集（≤12 个），优先取域名数最大者 |
+| 域名数相同取规则更少 | 同层比较 CIDR 条数；仍相同按域名排序取字典序最小，结果确定 |
+| 无可行方案明确告知 | `feasible=false`、`cidrs=[]`、`rule_count=null`，原因在 `message` |
+| 只读 | 不发起 DNS/HTTP 请求、不修改任何配置；CPU 搜索在线程池执行 |
+
+> “当前白名单本身已超出上限”同样视为**无可行方案**（`feasible=false`）：
+> 此时不存在任何既保持放行范围、又满足上限的清单。
+
+限制：候选域名 ≤12 个；单域名地址 ≤256 个，总地址 ≤1024 个（保证精确搜索在
+秒级完成）。空地址组、IPv6 地址/CIDR、重复域名、非法 CIDR 均返回 422。
+
+在 `/docs` 中展开 **plan** 分组，右侧 “Try it out” 上方有 3 个可直接运行的
+示例：`demo_merged`（并集与 /31 合并）、`demo_tradeoff`（域名数优先）、
+`demo_no_solution`（无解）。
+
 ## 演示场景与 DNS profile 切换
 
 本地 DNS 的解析数据按 profile 组织，可热切换：
@@ -149,6 +222,21 @@ curl -X POST http://127.0.0.1:8053/profiles/switch \
 | `swapped` | 同名域名从允许地址换到禁止地址（**检查后换址 / DNS rebinding**） |
 | `mixed` | 一次应答同时含允许与禁止地址，验证“全部获准才连接” |
 | `loop` | 连环 307 跳转，验证 3 次跳转上限 |
+| `planning` | 候选回调域名（白名单内/外/禁区），用于规划演示 |
+
+### 规划演示
+
+```bash
+# 方式一：一键在 compose 内跑规划演示（自动先用 /probe 收集地址组）
+docker compose --profile demo run --rm plan-demo
+
+# 方式二：宿主机上运行（probe 已 up）
+./scripts/plan-demo.sh          # 默认设备上限 4 条
+MAX_CIDRS=2 ./scripts/plan-demo.sh
+```
+
+脚本先逐域名调 `/api/v1/probe` 取完整地址组，再提交规划，并演示上限收紧与
+无解两种情形；也可直接在 <http://127.0.0.1:8000/docs> 的 plan 分组里操作。
 
 ## 配置项（探测服务环境变量）
 
@@ -166,13 +254,14 @@ curl -X POST http://127.0.0.1:8053/profiles/switch \
 ## 测试
 
 ```bash
-pip install -r requirements.txt pytest pytest-asyncio
+pip install -r requirements.txt pytest pytest-asyncio httpx
 pytest -q
 ```
 
-57 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
+127 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
 混合解析整体拒绝、检查后换址、跳转上限/跳禁区/非 HTTP 协议、HTTPS 证书
-主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层。
+主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层，以及
+白名单规划（精确最小 CIDR、覆盖核对、域名数/规则数最优、无解与只读）。
 
 ## 设计边界与说明
 
@@ -181,3 +270,6 @@ pytest -q
 - DNS 仅做 A 记录查询（AAAA 不存在即天然 IPv4-only）；
 - 演示 CA 与证书仅用于本地/compose 演示，生产环境应使用真实 PKI 并通过
   `CA_BUNDLE` 指定信任根。
+- 规划 API 是**无状态纯计算**：结果不会被下发到设备，也不会改写
+  `ALLOWED_CIDRS`；需要值班员自行审核后替换。清单基于请求方提交的地址组，
+  地址组必须来自探测报告的完整 `resolved_addresses`。
